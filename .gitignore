@@ -37,3 +37,6 @@ build/
 
 ### Mac OS ###
 .DS_Store
+# 可靠事件本地 WAL 数据目录
+data/
+target/
