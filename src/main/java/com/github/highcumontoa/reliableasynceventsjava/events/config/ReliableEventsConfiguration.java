@@ -57,6 +57,13 @@ public class ReliableEventsConfiguration {
         return new DefaultDeadLetterService(store);
     }
 
+    @Bean(destroyMethod = "shutdown")
+    public com.github.highcumontoa.reliableasynceventsjava.events.recovery.DefaultDeadLetterRecoveryService
+            deadLetterRecoveryService(DurableWALEventStore store) {
+        return new com.github.highcumontoa.reliableasynceventsjava.events.recovery
+                .DefaultDeadLetterRecoveryService(store);
+    }
+
     @Bean
     public EventDispatcher eventDispatcher(DurableWALEventStore store, HandlerRegistry registry,
                                            RetryPolicy retryPolicy, ReliableEventsProperties props) {

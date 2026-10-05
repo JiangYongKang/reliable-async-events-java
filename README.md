@@ -133,6 +133,41 @@ EventHandler（业务实现，返回的副作用 KV 与 SUCCEEDED 同批落盘�
   尝试次数清零，由正常分发链路重新领取；重放本身不执行任何副作用，因此不会产生重复副作用。
 - 可以多次重放；若问题未修复，事件会按相同规则再次进入死信。
 
+### 6.1 批量恢复（新增）
+
+根因修复后，可以一次恢复一批死信，而不必逐条重放：
+
+- **目标选择**：显式给一批 `eventIds`，或按条件筛选（`type` / `reason` /
+  `deadLetteredBeforeMillis`，无条件时匹配全部死信），两者可组合取并集；
+  启动时对目标集合做快照并去重，非死信与重复 ID 在快照阶段即被剔除。
+- **受控流速**：`concurrency` 限制“已重放未终态”的在途事件数，`ratePerSecond`
+  限制每秒重放条数，避免恢复流量打满处理链路与下游；在途上限同时保证
+  **新提交的正常事件不会被饿死**（恢复事件与新事件按到期时间公平竞争 worker）。
+- **进度与停止**：`progress(recoveryId)` 返回 total / replayed / succeeded /
+  deadAgain / inFlight / remaining；`stop(recoveryId)` 中途停止——已重放的继续处理完，
+  未重放的保持死信。
+- **幂等**：每条事件重放前重新检查状态，已不在死信态（重复发起、停止后续跑、
+  并发重放）直接跳过；重放本身不产生业务副作用，事件处理仍受租约 + KV 覆盖保护，
+  因此同一批重复提交或停止后再次恢复都不会产生重复副作用，最终一致跑完。
+- **重启**：恢复任务进度本身是内存状态，不持久化；但每一次重放都是 WAL 落盘的
+  状态流转，进程重启后已重放的保持 PENDING、未重放的仍是死信，**用相同条件重新
+  发起恢复即可幂等续跑**，不会出现半截结果。
+
+## 6.2 流转历史（新增）
+
+每一次状态变化都会留下一条不可变的流转记录（`EventTransition`）：发生时间、
+`fromStatus -> toStatus`、触发来源（`SUBMIT` / `CLAIM` / `RETRY_SCHEDULED` /
+`SUCCEED` / `DEAD_LETTER` / `REPLAY`）、原因或触发细节（错误信息、死信原因、
+重放来源、尝试次数等）。
+
+- **与状态严格一致**：历史条目与对应的状态流转在**同一个 WAL 提交批次**内落盘，
+  要么都可见、要么都不可见；任何事件的历史末条 `toStatus` 恒等于其当前状态。
+- **重启与终态后保留**：历史全部由 WAL 重放重建，进程重启、事件到达终态之后
+  依然完整可查。
+- **查询方式**：按单个事件拉完整时间线（`historyOf`）；或跨事件按类型、
+  结果状态（`toStatus`）、触发来源、时间窗口检索（`query`），
+  `offset + limit` 分页，`limit` 默认 100、上限 1000，防止一次倒出全量。
+
 ## 7. REST 接口（演示）
 
 | 方法与路径 | 说明 |
@@ -142,6 +177,11 @@ EventHandler（业务实现，返回的副作用 KV 与 SUCCEEDED 同批落盘�
 | `GET /api/events/by-key/{idempotencyKey}` | 按幂等键查询 |
 | `GET /api/events/dead-letters` | 列出全部死信 |
 | `POST /api/events/{eventId}/replay` | 重放死信 |
+| `GET /api/events/{eventId}/history` | 单个事件的完整流转时间线 |
+| `GET /api/events/history/search?type=&toStatus=&trigger=&from=&to=&offset=&limit=` | 跨事件历史检索（分页，limit≤1000），返回 `total/offset/limit/records` |
+| `POST /api/events/dead-letters/recovery` | 发起批量恢复。body：`{"eventIds":[...],"type","reason","deadLetteredBeforeMillis","concurrency","ratePerSecond"}`（均可选），返回 `recoveryId` |
+| `GET /api/events/dead-letters/recovery/{recoveryId}` | 查询恢复进度 |
+| `POST /api/events/dead-letters/recovery/{recoveryId}/stop` | 中途停止恢复 |
 
 ## 8. 本地验证（一条命令，无需任何外部依赖）
 
@@ -151,17 +191,20 @@ EventHandler（业务实现，返回的副作用 KV 与 SUCCEEDED 同批落盘�
 mvn test
 ```
 
-该命令运行全部 20 个测试，覆盖需求列出的全部场景：
+该命令运行全部 31 个测试，覆盖需求列出的全部场景：
 
 | 测试类 | 覆盖场景 |
 | --- | --- |
 | `DurableFileLogTests` | WAL 原子批次、重启重放、崩溃撕裂写自动截断 |
 | `EventStoreStateMachineTests` | 幂等提交、租约条件更新、退避重试、三种死信原因区分、死信重放、重启状态恢复、租约超时回收 |
 | `DispatcherFailureClassificationTests` | 瞬时故障自动重试恢复、永久故障直入死信、消费期校验失败死信、重试耗尽死信、修复后死信重放成功且副作用唯一 |
+| `EventHistoryTests`（新增） | 单事件完整时间线（5 种触发来源、时间/原因/尝试次数）、死信与重放原因可解释、重启后历史保留且与状态严格一致、跨事件按类型/结果/时间窗检索与分页限量 |
+| `DeadLetterRecoveryTests`（新增） | 按条件批量恢复、并发/速率受控、进度可查、中途停止、停止后续跑与重复提交幂等、恢复期间新事件不被饿死、根因未修复再次死信计入进度、恢复中进程重启无半截状态且幂等续跑 |
 | `ConcurrentSubmissionTests` | 800 次并发重复提交仅 1 条事件；100 个不同键并发全部落盘不丢 |
 | `ConcurrentConsumptionTests` | 多分发器/多 worker 并发消费每事件恰好一次；瞬时失败在并发下恢复 |
 | `RestartRecoveryTests` | 处理中崩溃后重启：已完成不重复、在途事件租约超时回收后完成 |
 | `SpringBootIntegrationTests` | REST 端到端：提交、自动消费/死信、400 拒绝非法输入、幂等重复、死信查询与重放 |
+| `SpringBootHistoryRecoveryApiTests`（新增） | REST 端到端：单事件时间线、跨事件检索分页、批量恢复发起/进度/停止 |
 | `ApplicationTests` | Spring 上下文装配冒烟 |
 
 测试日志按要求打印**输入**（幂等键、类型、payload、并发规模）、**事件状态变化**
@@ -180,10 +223,30 @@ curl -s -X POST localhost:8080/api/events -H 'Content-Type: application/json' \
 curl -s localhost:8080/api/events/by-key/o-1
 curl -s localhost:8080/api/events/dead-letters
 curl -s -X POST localhost:8080/api/events/<eventId>/replay
+# 流转历史：单事件时间线 / 跨事件检索
+curl -s localhost:8080/api/events/<eventId>/history
+curl -s 'localhost:8080/api/events/history/search?toStatus=DEAD_LETTER&limit=10'
+# 批量恢复死信（未注册类型会再次死信，可观察 deadAgain 进度）
+curl -s -X POST localhost:8080/api/events/dead-letters/recovery \
+  -H 'Content-Type: application/json' -d '{"type":"DEMO","concurrency":2,"ratePerSecond":10}'
+curl -s localhost:8080/api/events/dead-letters/recovery/<recoveryId>
+curl -s -X POST localhost:8080/api/events/dead-letters/recovery/<recoveryId>/stop
 ```
 
 > 注：默认无内置 `DEMO` 处理器，未注册类型会进入死信（`NON_RETRYABLE`），
 > 可用于直接观察死信与重放流程；业务事件类型请实现 `EventHandler` 并注册为 Spring Bean。
+
+## 8.1 兼容范围（本轮新增能力对既有行为的影响）
+
+- **WAL 格式**：新增 `HISTORY` 条目类型，与对应状态流转同批追加。旧版本写入的
+  WAL 文件（无 `HISTORY` 条目）可正常恢复——历史查询对旧流转返回空，新发生的
+  流转正常记录；旧代码读取新文件时会按“未知条目类型”告警并跳过 `HISTORY`，
+  状态恢复不受影响。
+- **API**：`EventStore.replay(eventId, nowMillis)` 保留为默认方法（来源记为
+  `MANUAL`），新增带触发来源的重载；其余既有接口签名与语义不变。
+- **行为**：幂等提交、租约恰好一次、退避重试、死信分类、重启恢复等既有保证
+  全部不变（原有 20 个测试无修改全部通过）；历史记录与批量恢复均为
+  在既有状态机之上的增量能力，不改变任何既有状态流转规则。
 
 ## 9. 主要代码位置
 
@@ -194,9 +257,11 @@ src/main/java/com/github/highcumontoa/reliableasynceventsjava/events/
 ├─ EventValidationException / NonRetryableEventException / OptimisticLockingFailureException
 ├─ RetryPolicy / ExponentialBackoffRetryPolicy    # 指数退避
 ├─ log/DurableFileLog                             # 帧格式 + fsync + CRC + 撕裂写截断
-├─ DurableWALEventStore                           # WAL 重放状态机、租约条件更新
+├─ DurableWALEventStore                           # WAL 重放状态机、租约条件更新、流转历史同批落盘
+├─ history/                                       # 流转历史：EventTransition / TransitionTrigger / HistoryQuery / EventHistoryStore
+├─ recovery/                                      # 批量恢复：RecoveryRequest / RecoveryProgress / DeadLetterRecoveryService 及默认实现
 ├─ HandlerRegistry / DefaultEventPublisher / DefaultDeadLetterService
 ├─ EventDispatcher                                # 后台轮询消费与失败分类（SmartLifecycle）
 ├─ config/ReliableEvents*                         # Spring 装配与配置属性
-└─ api/ReliableEventsController                   # REST 接口
+└─ api/ReliableEventsController                   # REST 接口（提交/查询/历史检索/死信/批量恢复）
 ```

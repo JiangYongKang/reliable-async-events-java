@@ -37,7 +37,12 @@ public interface EventStore {
                         String errorMessage, long nowMillis);
 
     /** 死信重放：DEAD_LETTER -&gt; PENDING 并清除租约与错误，等待正常领取。 */
-    EventRecord replay(String eventId, long nowMillis);
+    default EventRecord replay(String eventId, long nowMillis) {
+        return replay(eventId, "MANUAL", nowMillis);
+    }
+
+    /** 死信重放（带触发来源，写入流转历史）。 */
+    EventRecord replay(String eventId, String source, long nowMillis);
 
     List<EventRecord> findByStatus(EventStatus status);
 
