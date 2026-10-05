@@ -37,11 +37,25 @@ public interface EventStore {
                         String errorMessage, long nowMillis);
 
     /** 死信重放：DEAD_LETTER -&gt; PENDING 并清除租约与错误，等待正常领取。 */
-    EventRecord replay(String eventId, long nowMillis);
+    default EventRecord replay(String eventId, long nowMillis) {
+        return replay(eventId, nowMillis, "manual-replay");
+    }
+
+    /**
+     * 死信重放（带触发来源）：DEAD_LETTER -&gt; PENDING。
+     * {@code trigger} 会写入流转历史（如 manual-replay、batch-recovery:&lt;jobId&gt;）。
+     */
+    EventRecord replay(String eventId, long nowMillis, String trigger);
 
     List<EventRecord> findByStatus(EventStatus status);
 
     List<EventRecord> findDeadLetters();
+
+    /** 单个事件的完整流转时间线（按发生顺序，重启后仍可查）。 */
+    List<TransitionRecord> historyOf(String eventId);
+
+    /** 跨事件检索流转历史：按类型 / 动作 / 目标状态 / 时间窗口过滤，分页返回。 */
+    TransitionPage searchTransitions(TransitionQuery query);
 
     /** 强制等待此前所有追加记录完成磁盘持久化（测试可观测）。 */
     void flush();

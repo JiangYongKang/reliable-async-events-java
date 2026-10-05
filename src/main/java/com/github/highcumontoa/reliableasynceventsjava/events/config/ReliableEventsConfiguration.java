@@ -58,6 +58,11 @@ public class ReliableEventsConfiguration {
     }
 
     @Bean
+    public DeadLetterRecoveryService deadLetterRecoveryService(DurableWALEventStore store) {
+        return new DefaultDeadLetterRecoveryService(store);
+    }
+
+    @Bean
     public EventDispatcher eventDispatcher(DurableWALEventStore store, HandlerRegistry registry,
                                            RetryPolicy retryPolicy, ReliableEventsProperties props) {
         return new EventDispatcher(store, registry, retryPolicy,

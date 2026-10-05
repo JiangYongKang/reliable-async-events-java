@@ -31,6 +31,8 @@ import java.util.concurrent.atomic.AtomicLong;
  *   <li>{@code RETRY}: 瞬时故障后排定下次重试；</li>
  *   <li>{@code DEAD}: 进入死信（携带区分原因）；</li>
  *   <li>{@code REPLAY}: 死信重放回到 PENDING。</li>
+ *   <li>{@code HISTORY}: 流转历史，与对应的状态流转条目同批落盘（同一次 fsync），
+ *       保证历史与状态要么同时可见、要么同时不可见。</li>
  * </ul>
  */
 public class DurableWALEventStore implements EventStore, BusinessStateStore {
@@ -42,6 +44,7 @@ public class DurableWALEventStore implements EventStore, BusinessStateStore {
     private static final String KIND_RETRY = "RETRY";
     private static final String KIND_DEAD = "DEAD";
     private static final String KIND_REPLAY = "REPLAY";
+    private static final String KIND_HISTORY = "HISTORY";
 
     private final DurableFileLog wal;
     private final RetryPolicy retryPolicy;
@@ -55,6 +58,10 @@ public class DurableWALEventStore implements EventStore, BusinessStateStore {
     private final Map<String, String> idempotencyIndex = new LinkedHashMap<>();
     // 业务副作用 KV
     private final Map<String, String> businessState = new LinkedHashMap<>();
+    // eventId -> 该事件的完整流转时间线（按发生顺序）
+    private final Map<String, List<TransitionRecord>> historyByEvent = new LinkedHashMap<>();
+    // 全部流转记录（按 WAL 顺序，seq 即下标），用于跨事件检索
+    private final List<TransitionRecord> allHistory = new ArrayList<>();
 
     private final AtomicLong leaseCounter = new AtomicLong();
 
@@ -79,15 +86,16 @@ public class DurableWALEventStore implements EventStore, BusinessStateStore {
                 case KIND_RETRY -> applyRetry(e.body(), false);
                 case KIND_DEAD -> applyDead(e.body(), false);
                 case KIND_REPLAY -> applyReplay(e.body(), false);
+                case KIND_HISTORY -> applyHistory(e.body());
                 default -> log.warn("恢复时忽略未知 WAL 条目类型: {}", e.kind());
             }
         }
         long activeLeases = byEventId.values().stream()
                 .filter(ev -> ev.status() == EventStatus.PENDING && ev.leaseToken() != 0).count();
-        log.info("事件存储恢复完成: 事件总数={}, 死信={}, 业务键={}, 未释放租约(等待超时回收)={}",
+        log.info("事件存储恢复完成: 事件总数={}, 死信={}, 业务键={}, 历史记录={}, 未释放租约(等待超时回收)={}",
                 byEventId.size(),
                 byEventId.values().stream().filter(ev -> ev.status() == EventStatus.DEAD_LETTER).count(),
-                businessState.size(), activeLeases);
+                businessState.size(), allHistory.size(), activeLeases);
     }
 
     // ------------------------------------------------------------------ 提交
@@ -124,9 +132,12 @@ public class DurableWALEventStore implements EventStore, BusinessStateStore {
                             "payload", ev.payload(),
                             "maxAttempts", ev.maxAttempts(),
                             "createdAtMillis", ev.createdAtMillis()))));
+            // 历史记录与状态流转同批落盘：要么同时可见，要么同时不可见
+            batch.add(historyEntry(ev.eventId(), ev.type(), TransitionAction.SUBMITTED,
+                    null, EventStatus.PENDING, 0, nowMillis, null, "submit"));
             wal.appendBatch(batch);
             for (DurableFileLog.Entry e : batch) {
-                applySubmit(e.jsonBody(), true);
+                applyEntry(e);
             }
             log.info("新事件已原子提交(业务写入 {} 项 + 事件 1 项, 单批 fsync): eventId={} key={} type={} payload={}",
                     entitySideEffects == null ? 0 : entitySideEffects.size(),
@@ -165,10 +176,17 @@ public class DurableWALEventStore implements EventStore, BusinessStateStore {
             boolean staleLease = ev.leaseToken() != 0L;
             long token = leaseCounter.incrementAndGet();
             int newAttemptCount = ev.attemptCount() + 1;
-            wal.append(KIND_RETRY, json(Map.of(
+            List<DurableFileLog.Entry> batch = new ArrayList<>();
+            batch.add(new DurableFileLog.Entry(KIND_RETRY, json(Map.of(
                     "op", "CLAIM", "eventId", ev.eventId(), "leaseToken", token,
                     "attemptCount", newAttemptCount, "at", nowMillis,
-                    "staleLease", staleLease)));
+                    "staleLease", staleLease))));
+            batch.add(historyEntry(ev.eventId(), ev.type(), TransitionAction.CLAIMED,
+                    ev.status(), EventStatus.PENDING, newAttemptCount, nowMillis,
+                    staleLease ? "旧租约超时回收后重新领取 lease=" + ev.leaseToken() : null,
+                    "dispatcher-claim"));
+            wal.appendBatch(batch);
+            applyHistory(batch.get(1).jsonBody());
             EventRecord claimed = new EventRecord(ev.eventId(), ev.idempotencyKey(), ev.type(), ev.payload(),
                     EventStatus.PENDING, newAttemptCount, ev.maxAttempts(), ev.createdAtMillis(),
                     ev.nextAttemptAtMillis(), nowMillis, token, ev.lastError(),
@@ -206,9 +224,12 @@ public class DurableWALEventStore implements EventStore, BusinessStateStore {
             }
             batch.add(new DurableFileLog.Entry(KIND_SUCCEED, json(Map.of(
                     "op", "SUCCEEDED", "eventId", eventId, "at", nowMillis))));
+            batch.add(historyEntry(eventId, ev.type(), TransitionAction.SUCCEEDED,
+                    EventStatus.PENDING, EventStatus.SUCCEEDED, ev.attemptCount(),
+                    nowMillis, null, "dispatcher"));
             wal.appendBatch(batch);
             for (DurableFileLog.Entry e : batch) {
-                applySucceed(e.jsonBody(), true);
+                applyEntry(e);
             }
             log.info("事件处理成功并原子落盘(消费副作用 {} 项 + SUCCEEDED 同批 fsync): eventId={} 尝试次数={}",
                     sideEffects == null ? 0 : sideEffects.size(), eventId, ev.attemptCount());
@@ -240,8 +261,14 @@ public class DurableWALEventStore implements EventStore, BusinessStateStore {
                 m.put("error", truncate(errorMessage));
                 m.put("at", nowMillis);
                 String op = json(m);
-                wal.append(KIND_RETRY, op);
+                List<DurableFileLog.Entry> batch = new ArrayList<>();
+                batch.add(new DurableFileLog.Entry(KIND_RETRY, op));
+                batch.add(historyEntry(eventId, ev.type(), TransitionAction.RETRY_SCHEDULED,
+                        EventStatus.PENDING, EventStatus.RETRYING, attempts,
+                        nowMillis, errorMessage, "dispatcher"));
+                wal.appendBatch(batch);
                 applyRetry(op, true);
+                applyHistory(batch.get(1).jsonBody());
                 log.info("瞬时故障，进入重试等待: eventId={} 已尝试 {}/{} nextAttemptAt=+{}ms 原因={}",
                         eventId, attempts, ev.maxAttempts(),
                         nextAttemptAtMillis - nowMillis, truncate(errorMessage));
@@ -269,8 +296,14 @@ public class DurableWALEventStore implements EventStore, BusinessStateStore {
         m.put("error", truncate(errorMessage));
         m.put("at", nowMillis);
         String op = json(m);
-        wal.append(KIND_DEAD, op);
+        List<DurableFileLog.Entry> batch = new ArrayList<>();
+        batch.add(new DurableFileLog.Entry(KIND_DEAD, op));
+        batch.add(historyEntry(ev.eventId(), ev.type(), TransitionAction.DEAD_LETTER,
+                ev.status(), EventStatus.DEAD_LETTER, ev.attemptCount(),
+                nowMillis, reason.name() + ": " + truncate(errorMessage), "dispatcher"));
+        wal.appendBatch(batch);
         applyDead(op, true);
+        applyHistory(batch.get(1).jsonBody());
         log.warn("事件进入死信[{}]: eventId={} 尝试次数={} 判定依据={}",
                 reason, ev.eventId(), ev.attemptCount(), truncate(errorMessage));
     }
@@ -278,18 +311,24 @@ public class DurableWALEventStore implements EventStore, BusinessStateStore {
     // ------------------------------------------------------------------ 重放
 
     @Override
-    public EventRecord replay(String eventId, long nowMillis) {
+    public EventRecord replay(String eventId, long nowMillis, String trigger) {
         synchronized (lock) {
             EventRecord ev = requireEvent(eventId);
             if (ev.status() != EventStatus.DEAD_LETTER) {
                 throw new EventException("仅死信事件可重放: eventId=" + eventId + " 当前状态=" + ev.status());
             }
             String op = json(Map.of("eventId", eventId, "at", nowMillis));
-            wal.append(KIND_REPLAY, op);
+            List<DurableFileLog.Entry> batch = new ArrayList<>();
+            batch.add(new DurableFileLog.Entry(KIND_REPLAY, op));
+            batch.add(historyEntry(eventId, ev.type(), TransitionAction.REPLAYED,
+                    EventStatus.DEAD_LETTER, EventStatus.PENDING, 0,
+                    nowMillis, "原死信原因: " + ev.deadLetterReason(), trigger));
+            wal.appendBatch(batch);
             applyReplay(op, true);
+            applyHistory(batch.get(1).jsonBody());
             EventRecord after = byEventId.get(eventId);
-            log.info("死信重放: eventId={} 原死信原因={} -> PENDING（attemptCount 已重置，不产生重复副作用，成功副作用以 KV 覆盖保证幂等）",
-                    eventId, ev.deadLetterReason());
+            log.info("死信重放[{}]: eventId={} 原死信原因={} -> PENDING（attemptCount 已重置，不产生重复副作用，成功副作用以 KV 覆盖保证幂等）",
+                    trigger, eventId, ev.deadLetterReason());
             return after;
         }
     }
@@ -328,6 +367,32 @@ public class DurableWALEventStore implements EventStore, BusinessStateStore {
         }
     }
 
+    // ------------------------------------------------------------------ 流转历史
+
+    @Override
+    public List<TransitionRecord> historyOf(String eventId) {
+        synchronized (lock) {
+            return List.copyOf(historyByEvent.getOrDefault(eventId, List.of()));
+        }
+    }
+
+    @Override
+    public TransitionPage searchTransitions(TransitionQuery query) {
+        synchronized (lock) {
+            List<TransitionRecord> filtered = allHistory.stream()
+                    .filter(r -> query.eventType() == null || r.eventType().equals(query.eventType()))
+                    .filter(r -> query.action() == null || r.action() == query.action())
+                    .filter(r -> query.toStatus() == null || r.toStatus() == query.toStatus())
+                    .filter(r -> query.fromMillis() == null || r.atMillis() >= query.fromMillis())
+                    .filter(r -> query.toMillis() == null || r.atMillis() <= query.toMillis())
+                    .toList();
+            int from = Math.min(query.offset(), filtered.size());
+            int to = Math.min(from + query.limit(), filtered.size());
+            return new TransitionPage(List.copyOf(filtered.subList(from, to)),
+                    query.offset(), query.limit(), filtered.size());
+        }
+    }
+
     @Override
     public Optional<String> get(String key) {
         synchronized (lock) {
@@ -349,6 +414,61 @@ public class DurableWALEventStore implements EventStore, BusinessStateStore {
     }
 
     // ------------------------------------------------------------- WAL 应用
+
+    /** 按条目类型分发应用（用于提交批次内同时含状态条目与历史条目的情况）。 */
+    private void applyEntry(DurableFileLog.Entry e) {
+        switch (e.kind()) {
+            case KIND_SUBMIT -> applySubmit(e.jsonBody(), true);
+            case KIND_SUCCEED -> applySucceed(e.jsonBody(), true);
+            case KIND_RETRY -> applyRetry(e.jsonBody(), true);
+            case KIND_DEAD -> applyDead(e.jsonBody(), true);
+            case KIND_REPLAY -> applyReplay(e.jsonBody(), true);
+            case KIND_HISTORY -> applyHistory(e.jsonBody());
+            default -> throw new IllegalStateException("未知 WAL 条目类型: " + e.kind());
+        }
+    }
+
+    /** 构造一条历史记录 WAL 条目（seq 不落盘，应用时按 WAL 顺序分配，保证重启后连续）。 */
+    private DurableFileLog.Entry historyEntry(String eventId, String type, TransitionAction action,
+                                              EventStatus from, EventStatus to, int attemptCount,
+                                              long at, String reason, String trigger) {
+        Map<String, Object> m = new LinkedHashMap<>();
+        m.put("eventId", eventId);
+        m.put("eventType", type);
+        m.put("action", action.name());
+        if (from != null) {
+            m.put("fromStatus", from.name());
+        }
+        if (to != null) {
+            m.put("toStatus", to.name());
+        }
+        m.put("attemptCount", attemptCount);
+        m.put("at", at);
+        if (reason != null) {
+            m.put("reason", truncate(reason));
+        }
+        if (trigger != null) {
+            m.put("trigger", trigger);
+        }
+        return new DurableFileLog.Entry(KIND_HISTORY, json(m));
+    }
+
+    private void applyHistory(String body) {
+        JsonNode n = parse(body);
+        TransitionRecord r = new TransitionRecord(
+                allHistory.size(),
+                n.get("eventId").asText(),
+                n.get("eventType").asText(),
+                TransitionAction.valueOf(n.get("action").asText()),
+                n.has("fromStatus") ? EventStatus.valueOf(n.get("fromStatus").asText()) : null,
+                n.has("toStatus") ? EventStatus.valueOf(n.get("toStatus").asText()) : null,
+                n.get("attemptCount").asInt(),
+                n.get("at").asLong(),
+                n.has("reason") ? n.get("reason").asText() : null,
+                n.has("trigger") ? n.get("trigger").asText() : null);
+        allHistory.add(r);
+        historyByEvent.computeIfAbsent(r.eventId(), k -> new ArrayList<>()).add(r);
+    }
 
     private void applySubmit(String body, boolean alreadyJson) {
         JsonNode n = parse(body);
