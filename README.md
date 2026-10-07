@@ -167,11 +167,22 @@ seq, eventId, eventType, action, fromStatus, toStatus, attemptCount, atMillis, r
 
 - **选事件**：显式 `eventIds` 列表，或条件筛选（`eventType` / `reason` /
   `deadLetteredBeforeMillis`），两者取并集去重；任务启动时对目标集合做快照。
-- **受控恢复**：`ratePerSecond` 全局限速（每秒最多重放多少条）+ `concurrency`
-  并发上限，避免恢复流量打满处理链路与下游。
+  **两者都不给（全空请求）时，语义为“全量恢复当前所有死信”**——线上积压可以一次性清掉，
+  不会空跑报完成。
+- **零命中如实上报**：若快照目标为空（例如给了筛选条件但一条都没命中），任务以
+  `COMPLETED_EMPTY` 结束且 `total/replayed` 均为 0，与“有目标且全部处理完”的
+  `COMPLETED` 明确区分，避免把“没命中”误判成“恢复已生效”。
+- **受控恢复**（两个参数各管一段，共同约束对处理链路与下游的冲击）：
+  - `ratePerSecond`：全局限速，约束把死信**重放回 PENDING 的注入速率**（每秒最多多少条）；
+  - `concurrency`：并发上限，约束**已重放、但尚未到达终态**（SUCCEEDED/DEAD_LETTER）
+    的恢复事件数。每条事件重放成功即占用一个额度，由在途观察者确认其到达终态后才释放；
+    额度占满时注入暂停——下游处理慢、事件迟迟不到终态时，恢复流量会自动停下来，
+    而不是只约束“重放”这一轻动作。任务落幕（COMPLETED/STOPPED）前会等在途事件全部
+    到达终态，结束时 `inFlight` 归零。
 - **进度可查 / 可停止**：任务异步执行，`progress(jobId)` 返回
-  `total/replayed/skipped/failed` 与状态（RUNNING/STOPPING/STOPPED/COMPLETED/FAILED）；
-  `stop(jobId)` 幂等请求中途停止，在途重放收尾后任务进入 STOPPED。
+  `total/replayed/skipped/failed/inFlight` 与状态
+  （RUNNING/STOPPING/STOPPED/COMPLETED/COMPLETED_EMPTY/FAILED）；
+  `stop(jobId)` 幂等请求中途停止，在途事件到达终态后任务进入 STOPPED。
 - **幂等与最终一致**：
   - 单条重放仍是原子的 WAL 批次（REPLAY + HISTORY 同批 fsync），进程在任意时刻被强杀，
     已重放的保持 PENDING、未重放的保持死信，**不留半截状态**；
@@ -194,8 +205,8 @@ seq, eventId, eventType, action, fromStatus, toStatus, attemptCount, atMillis, r
 | `POST /api/events/{eventId}/replay` | 重放死信 |
 | `GET /api/events/{eventId}/history` | 单个事件的完整流转时间线 |
 | `GET /api/events/history?type=&action=&toStatus=&fromMillis=&toMillis=&offset=&limit=` | 跨事件检索流转历史（分页，limit≤500） |
-| `POST /api/events/dead-letters/recover` | 发起批量恢复。body：`{"eventIds":[...],"eventType","reason","deadLetteredBeforeMillis","ratePerSecond","concurrency"}`（均可选，速率默认 10/s、并发默认 2），返回 `jobId` |
-| `GET /api/events/recoveries/{jobId}` | 查询批量恢复进度 |
+| `POST /api/events/dead-letters/recover` | 发起批量恢复。body：`{"eventIds":[...],"eventType","reason","deadLetteredBeforeMillis","ratePerSecond","concurrency"}`（均可选，速率默认 10/s、并发默认 2；**全部不给 = 全量恢复当前所有死信**），返回 `jobId` |
+| `GET /api/events/recoveries/{jobId}` | 查询批量恢复进度（含 `inFlight`：已恢复未到终态的在途事件数；零命中任务状态为 `COMPLETED_EMPTY`） |
 | `POST /api/events/recoveries/{jobId}/stop` | 中途停止批量恢复（幂等） |
 
 ## 10. 本地验证（一条命令，无需任何外部依赖）
@@ -206,7 +217,7 @@ seq, eventId, eventType, action, fromStatus, toStatus, attemptCount, atMillis, r
 mvn test
 ```
 
-该命令运行全部 31 个测试，覆盖需求列出的全部场景：
+该命令运行全部 35 个测试，覆盖需求列出的全部场景：
 
 | 测试类 | 覆盖场景 |
 | --- | --- |
@@ -217,7 +228,7 @@ mvn test
 | `ConcurrentConsumptionTests` | 多分发器/多 worker 并发消费每事件恰好一次；瞬时失败在并发下恢复 |
 | `RestartRecoveryTests` | 处理中崩溃后重启：已完成不重复、在途事件租约超时回收后完成 |
 | `EventHistoryTests` | 全生命周期时间线、每步“历史末笔==当前状态”一致性、死信/重放的原因与触发来源、重启后历史完整且 seq 连续、跨事件过滤与分页、limit 硬上限校验 |
-| `BatchRecoveryTests` | 条件筛选批量恢复、限速生效、进度可查、显式 ID 恢复、同一批重复提交幂等跳过、中途停止+续跑无重复、新事件不被饿死、崩溃重启后恢复结果一致 |
+| `BatchRecoveryTests` | 不给条件的全量恢复、零命中如实上报 COMPLETED_EMPTY、条件筛选批量恢复、限速生效、并发上限管住在途恢复事件（阻塞处理器验证注入暂停与峰值）、进度可查、显式 ID 恢复、同一批重复提交幂等跳过、中途停止+续跑无重复、新事件不被饿死、崩溃重启后恢复结果一致、停止+重启续跑副作用不重复 |
 | `SpringBootIntegrationTests` | REST 端到端：提交、自动消费/死信、400 拒绝非法输入、幂等重复、死信查询与重放 |
 | `HistoryAndRecoveryApiTests` | REST 端到端：单事件时间线、跨事件历史检索分页、批量恢复发起/进度/停止、恢复后历史含 batch-recovery 来源 |
 | `ApplicationTests` | Spring 上下文装配冒烟 |
