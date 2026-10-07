@@ -10,6 +10,7 @@ public record RecoveryProgress(
         int replayed,
         int skipped,
         int failed,
+        int inFlight,
         long startedAtMillis,
         Long finishedAtMillis
 ) {
@@ -21,10 +22,12 @@ public record RecoveryProgress(
         STOPPING,
         /** 被中途停止（未处理的死信保持原状，可再次发起恢复）。 */
         STOPPED,
-        /** 全部目标事件处理完毕。 */
+        /** 全部目标事件处理完毕（replayed+skipped+failed == total，且在途事件均已到达终态）。 */
         COMPLETED,
         /** 任务内部异常终止。 */
-        FAILED
+        FAILED,
+        /** 没有任何目标事件（未给筛选条件且当前无死信，或筛选条件一条都没命中），实际恢复 0 条。 */
+        NO_TARGETS
     }
 
     /** 已处理（replayed+skipped+failed）数量。 */

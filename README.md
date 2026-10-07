@@ -166,12 +166,24 @@ seq, eventId, eventType, action, fromStatus, toStatus, attemptCount, atMillis, r
 根因修复后，可通过 `DeadLetterRecoveryService` / REST 一次恢复一批死信：
 
 - **选事件**：显式 `eventIds` 列表，或条件筛选（`eventType` / `reason` /
-  `deadLetteredBeforeMillis`），两者取并集去重；任务启动时对目标集合做快照。
-- **受控恢复**：`ratePerSecond` 全局限速（每秒最多重放多少条）+ `concurrency`
-  并发上限，避免恢复流量打满处理链路与下游。
+  `deadLetteredBeforeMillis`），两者取并集去重；**两者都不给时，语义为“恢复当前全部
+  死信”**（用于一次性清空线上积压）。任务启动时对目标集合做快照，启动后新进入的死信
+  不属于本任务。
+- **受控恢复（两个参数各管一件事）**：
+  - `ratePerSecond`：全局限速，约束“把死信重放回 PENDING”的**注入速率**（每秒最多多少条）；
+  - `concurrency`：**在途上限**，约束“已重放、但还没在处理链路上跑到终态（SUCCEEDED /
+    再次 DEAD_LETTER）”的恢复事件数量。每条事件重放后占用一个在途名额，到达终态才释放；
+    名额占满时暂停注入新的重放。因此并发上限真正管住在处理链路上流转的恢复事件数，
+    而不是只约束重放这一个轻量动作——速率与并发共同控制恢复流量对下游的冲击。
 - **进度可查 / 可停止**：任务异步执行，`progress(jobId)` 返回
-  `total/replayed/skipped/failed` 与状态（RUNNING/STOPPING/STOPPED/COMPLETED/FAILED）；
+  `total/replayed/skipped/failed/inFlight` 与状态
+  （RUNNING/STOPPING/STOPPED/COMPLETED/FAILED/**NO_TARGETS**）；
   `stop(jobId)` 幂等请求中途停止，在途重放收尾后任务进入 STOPPED。
+  - **零目标如实报告**：快照为空（没给条件且当前无死信，或筛选条件一条都没命中）时，
+    任务以 `NO_TARGETS` 结束，`total=0、replayed=0`，与“有目标且全部完成”的
+    `COMPLETED` 明确区分，避免线上误判恢复已生效。
+  - `COMPLETED` 表示全部目标处理完毕且在途事件均已到达终态；`inFlight` 字段随时可观测
+    当前在处理链路上流转的恢复事件数（永不超过 `concurrency`）。
 - **幂等与最终一致**：
   - 单条重放仍是原子的 WAL 批次（REPLAY + HISTORY 同批 fsync），进程在任意时刻被强杀，
     已重放的保持 PENDING、未重放的保持死信，**不留半截状态**；
@@ -180,8 +192,8 @@ seq, eventId, eventType, action, fromStatus, toStatus, attemptCount, atMillis, r
   - 停止后或重启后，用相同条件再发起一个任务即可续跑，最终所有死信一致地跑完；
     每条事件的重放历史恰好一条（`BatchRecoveryTests` 逐条断言）。
 - **不饿死新事件**：重放仅把事件置回 PENDING 并以其重放时刻参与
-  `nextAttemptAt` 公平排队，正常新事件按同一规则竞争领取；限速参数进一步约束
-  恢复流量的注入速率。
+  `nextAttemptAt` 公平排队，正常新事件按同一规则竞争领取；在途上限只约束恢复流量的
+  注入，不占用正常事件的领取机会。
 
 ## 9. REST 接口（演示）
 
@@ -194,7 +206,7 @@ seq, eventId, eventType, action, fromStatus, toStatus, attemptCount, atMillis, r
 | `POST /api/events/{eventId}/replay` | 重放死信 |
 | `GET /api/events/{eventId}/history` | 单个事件的完整流转时间线 |
 | `GET /api/events/history?type=&action=&toStatus=&fromMillis=&toMillis=&offset=&limit=` | 跨事件检索流转历史（分页，limit≤500） |
-| `POST /api/events/dead-letters/recover` | 发起批量恢复。body：`{"eventIds":[...],"eventType","reason","deadLetteredBeforeMillis","ratePerSecond","concurrency"}`（均可选，速率默认 10/s、并发默认 2），返回 `jobId` |
+| `POST /api/events/dead-letters/recover` | 发起批量恢复。body：`{"eventIds":[...],"eventType","reason","deadLetteredBeforeMillis","ratePerSecond","concurrency"}`（均可选，速率默认 10/s、在途上限默认 2；**全部不给 = 恢复当前所有死信**），返回 `jobId` 与即时进度 |
 | `GET /api/events/recoveries/{jobId}` | 查询批量恢复进度 |
 | `POST /api/events/recoveries/{jobId}/stop` | 中途停止批量恢复（幂等） |
 
@@ -206,7 +218,7 @@ seq, eventId, eventType, action, fromStatus, toStatus, attemptCount, atMillis, r
 mvn test
 ```
 
-该命令运行全部 31 个测试，覆盖需求列出的全部场景：
+该命令运行全部 35 个测试，覆盖需求列出的全部场景：
 
 | 测试类 | 覆盖场景 |
 | --- | --- |
@@ -217,7 +229,7 @@ mvn test
 | `ConcurrentConsumptionTests` | 多分发器/多 worker 并发消费每事件恰好一次；瞬时失败在并发下恢复 |
 | `RestartRecoveryTests` | 处理中崩溃后重启：已完成不重复、在途事件租约超时回收后完成 |
 | `EventHistoryTests` | 全生命周期时间线、每步“历史末笔==当前状态”一致性、死信/重放的原因与触发来源、重启后历史完整且 seq 连续、跨事件过滤与分页、limit 硬上限校验 |
-| `BatchRecoveryTests` | 条件筛选批量恢复、限速生效、进度可查、显式 ID 恢复、同一批重复提交幂等跳过、中途停止+续跑无重复、新事件不被饿死、崩溃重启后恢复结果一致 |
+| `BatchRecoveryTests` | 无条件整批恢复全部死信、零命中/零死信如实报告 NO_TARGETS、条件筛选批量恢复、限速生效、在途并发上限真正约束流转中的恢复事件数、进度可查、显式 ID 恢复、同一批重复提交幂等跳过、中途停止+续跑无重复、新事件不被饿死、崩溃重启后续跑无重复副作用 |
 | `SpringBootIntegrationTests` | REST 端到端：提交、自动消费/死信、400 拒绝非法输入、幂等重复、死信查询与重放 |
 | `HistoryAndRecoveryApiTests` | REST 端到端：单事件时间线、跨事件历史检索分页、批量恢复发起/进度/停止、恢复后历史含 batch-recovery 来源 |
 | `ApplicationTests` | Spring 上下文装配冒烟 |
@@ -242,8 +254,12 @@ curl -s -X POST localhost:8080/api/events/<eventId>/replay
 curl -s localhost:8080/api/events/<eventId>/history
 curl -s 'localhost:8080/api/events/history?action=DEAD_LETTER&offset=0&limit=50'
 # 批量恢复死信：发起 -> 查进度 -> （可选）停止
+# 按类型筛选：
 curl -s -X POST localhost:8080/api/events/dead-letters/recover -H 'Content-Type: application/json' \
   -d '{"eventType":"DEMO","ratePerSecond":10,"concurrency":2}'
+# 不给任何条件 = 恢复当前全部死信：
+curl -s -X POST localhost:8080/api/events/dead-letters/recover -H 'Content-Type: application/json' -d '{}'
+# 查进度（关注 status 与 total/replayed/inFlight：NO_TARGETS 表示这次一个目标都没有）：
 curl -s localhost:8080/api/events/recoveries/<jobId>
 curl -s -X POST localhost:8080/api/events/recoveries/<jobId>/stop
 ```
